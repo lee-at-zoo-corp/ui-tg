@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {"id": "plan", "data": {"name": "Plan", "state": "ready"}},
+    {"id": "build", "data": {"name": "Build", "state": "pending"}},
+    {"id": "test", "data": {"name": "Test", "state": "pending"}},
+    {"id": "ship", "data": {"name": "Ship", "state": "pending"}},
+    {"id": "notes", "data": {"name": "Notes", "state": "independent"}}
+  ],
+  "edges": [["plan", "build"], ["build", "test"], ["test", "build"], ["test", "ship"], ["plan", "ship"], ["notes", "notes"]]
+}

@@ -1,0 +1,9 @@
+{
+  "nodes": [
+    {"id": "project", "data": {"name": "Project", "path": "."}},
+    {"id": "src", "data": {"name": "Source", "path": "src"}},
+    {"id": "examples", "data": {"name": "Examples", "path": "examples"}},
+    {"id": "main", "data": {"name": "main.rs", "path": "src/main.rs"}}
+  ],
+  "edges": [["project", "src"], ["project", "examples"], ["src", "main"]]
+}
