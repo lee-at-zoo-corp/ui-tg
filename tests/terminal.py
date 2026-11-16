@@ -59,58 +59,51 @@ def exercise(piped):
                     transcript.extend(data)
             raise AssertionError(f"missing {text!r}: {transcript.decode(errors='replace')}")
 
-        def wait_for_flash(start, activated_at):
-            deadline = activated_at + 2
-            saw_reverse = False
-            while time.monotonic() < deadline:
-                # Inspect complete rendered frames, excluding any preceding redraw.
-                frames = bytes(transcript[start:]).split(b"\x1b[?2026l")
-                for frame in frames[:-1]:
-                    if b"\x1b[7m" in frame:
-                        saw_reverse = True
-                        reversed_cell = False
-                        for token in re.findall(r"\x1b\[[0-9;?]*[A-Za-z]|[^\x1b]", frame.decode()):
-                            if token == "\x1b[7m":
-                                reversed_cell = True
-                            elif token in ("\x1b[0m", "\x1b[27m"):
-                                reversed_cell = False
-                            elif reversed_cell and len(token) == 1:
-                                assert token not in "╔═╗║╚╝┌─┐│└┘", "node border inverted during activation"
-                    elif saw_reverse:
-                        elapsed = time.monotonic() - activated_at
-                        assert 0.17 <= elapsed < 1.0, f"flash lasted {elapsed:.3f}s"
-                        return
-                if select.select([master], [], [], 0.02)[0]:
-                    transcript.extend(os.read(master, 65536))
-            raise AssertionError("activation must invert the node and restore it after 200ms")
+        def cells():
+            # Read terminal attributes as well as glyphs, to check focus styling.
+            screen = {}
+            x = y = 0
+            reversed_cell = False
+            for token in re.findall(r"\x1b\[[0-9;?]*[A-Za-z]|[^\x1b]", transcript.decode()):
+                position = re.fullmatch(r"\x1b\[(\d+);(\d+)H", token)
+                if position:
+                    y, x = (int(part)-1 for part in position.groups())
+                elif token == "\x1b[7m":
+                    reversed_cell = True
+                elif token in ("\x1b[0m", "\x1b[27m"):
+                    reversed_cell = False
+                elif len(token) == 1:
+                    screen[(x,y)] = (token,reversed_cell)
+                    x += 1
+            return screen
 
         try:
             wait_for("Ready")
-            assert all(f"\x1b[3;{column}H{letter}".encode() in transcript for column, letter in enumerate("ROOT", 5)), "formatter label was not displayed"
+            assert cells()[(3,1)] == ('R',True), 'focused root must use reverse video'
+            assert cells()[(13,1)] == ('C',False), 'other nodes must not be inverted'
+            assert not any(c in transcript.decode() for c in '╔═╗║╚╝┌┐└┘'), 'node borders were rendered'
             assert not output.exists(), "focusing a node executed a command"
-            flash_start, activated_at = len(transcript), time.monotonic()
             os.write(master, b"\r")
             wait_for("Done:")
-            wait_for_flash(flash_start, activated_at)
             assert output.read_text().splitlines() == [raw], "activation changed raw JSON"
             # Right arrow focuses child, and does not activate it.
             os.write(master, b"\x1b[C")
             wait_for("[child]")
             assert output.read_text().splitlines() == [raw]
+            assert cells()[(3,1)] == ('R',False)
+            assert cells()[(13,1)] == ('C',True)
             # SGR mouse left click at the center of the root node.
-            flash_start, activated_at = len(transcript), time.monotonic()
-            os.write(master, b"\x1b[<0;5;3M\x1b[<0;5;3m")
+            os.write(master, b"\x1b[<0;5;2M\x1b[<0;5;2m")
             wait_for("Done:")
-            wait_for_flash(flash_start, activated_at)
             assert output.read_text().splitlines() == [raw, raw]
             # Resize, Tab to child outside the narrow viewport, then activate.
-            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 24, 0, 0))
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 12, 0, 0))
             os.kill(pid, signal.SIGWINCH)
             wait_for("\x1b[11;1H")
             os.write(master, b"\t")
             wait_for("[child]")
             os.write(master, b"\r")
-            wait_for("Done:")
+            wait_for("[child] Done")
             assert json.loads(output.read_text().splitlines()[-1]) == {"name": "Child"}
             os.write(master, b"q")
             deadline = time.monotonic() + 5

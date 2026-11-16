@@ -294,7 +294,7 @@ mod tests {
             assert!(l.hit(x, y).is_none(), "wire intersects node at {x},{y}");
         }
         for (i, r) in l.boxes.iter().enumerate() {
-            assert_eq!(l.hit(r.x + 1, r.y + 1), Some(i));
+            assert_eq!(l.hit(r.x, r.y), Some(i));
         }
         assert_eq!(l.neighbor(0, 1, 0), 1);
     }
@@ -330,7 +330,7 @@ mod tests {
                     assert!(x < layout.width && y < layout.height, "wire outside canvas");
                 }
                 for (i, rect) in layout.boxes.iter().enumerate() {
-                    assert_eq!(layout.hit(rect.x + 1, rect.y + 1), Some(i));
+                    assert_eq!(layout.hit(rect.x, rect.y), Some(i));
                 }
             }
         }
@@ -350,7 +350,7 @@ mod tests {
             let layout = Layout::new(&graph, &["old\ncommit".into(), "new".into()], 20, direction);
             let old = layout.boxes[0];
             let new = layout.boxes[1];
-            assert_eq!((old.w, old.h, new.w, new.h), (20, 4, 20, 3));
+            assert_eq!((old.w, old.h, new.w, new.h), (8, 2, 5, 1));
             assert_eq!(layout.neighbor(0, dx, dy), 1, "direction {direction:?}");
             assert!(layout.edges.values().any(|&c| c == arrow));
         }
@@ -366,6 +366,102 @@ mod tests {
                 layout.boxes[target].y < layout.boxes[source].y,
                 "{from} -> {to} must point north"
             );
+        }
+    }
+    #[test]
+    fn compact_tree_uses_one_row_per_label_and_side_connections() {
+        let graph = Graph::parse(r#"{"nodes":[{"id":"root","data":0},{"id":"dir","data":0},{"id":"a","data":0},{"id":"b","data":0}],"edges":[["root","dir"],["dir","a"],["dir","b"]]}"#).unwrap();
+        let layout = Layout::tree(
+            &graph,
+            &["root".into(), "dir/".into(), "a".into(), "b".into()],
+            30,
+            Direction::South,
+        )
+        .unwrap();
+        for (i, r) in layout.boxes.iter().enumerate() {
+            assert_eq!(r.y, i + 1);
+            assert_eq!(r.h, 1);
+            assert!(r.w <= 6, "short labels should not reserve 30 columns");
+        }
+        for &(x, y) in layout.edges.keys() {
+            assert!(layout.hit(x, y).is_none());
+        }
+        assert!(
+            Layout::tree(
+                &graph,
+                &["root".into(), "dir/".into(), "a".into(), "b".into()],
+                30,
+                Direction::North
+            )
+            .unwrap()
+            .boxes[3]
+                .y
+                < layout.boxes[3].y
+        );
+    }
+    #[test]
+    fn tree_layout_rejects_cycles_and_multiple_parents() {
+        for edges in [
+            serde_json::json!([["a", "b"], ["b", "a"]]),
+            serde_json::json!([["a", "b"], ["c", "b"]]),
+        ] {
+            let graph = Graph::parse(&serde_json::json!({"nodes":[{"id":"a","data":0},{"id":"b","data":0},{"id":"c","data":0}],"edges":edges}).to_string()).unwrap();
+            assert!(
+                Layout::tree(
+                    &graph,
+                    &["a".into(), "b".into(), "c".into()],
+                    20,
+                    Direction::South
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn down_in_an_outline_visits_children_before_the_next_directory() {
+        let graph = Graph::parse(r#"{"nodes":[{"id":"r","data":0},{"id":"d","data":0},{"id":"a","data":0},{"id":"b","data":0},{"id":"s","data":0}],"edges":[["r","d"],["r","s"],["d","a"],["d","b"]]}"#).unwrap();
+        let layout = Layout::tree(
+            &graph,
+            &[
+                "root".into(),
+                "dir".into(),
+                "a".into(),
+                "b".into(),
+                "sibling".into(),
+            ],
+            20,
+            Direction::South,
+        )
+        .unwrap();
+        assert_eq!(layout.neighbor(1, 0, 1), 2);
+        assert_eq!(layout.neighbor(2, 0, 1), 3);
+        assert_eq!(layout.neighbor(3, 0, 1), 4);
+    }
+    #[test]
+    fn vertical_history_with_different_label_widths_has_a_straight_spine() {
+        let graph = Graph::parse(
+            r#"{"nodes":[{"id":"old","data":0},{"id":"new","data":0}],"edges":[["old","new"]]}"#,
+        )
+        .unwrap();
+        for direction in [Direction::North, Direction::South] {
+            let layout = Layout::new(
+                &graph,
+                &[
+                    "short\nold".into(),
+                    "a much longer commit message\nnew".into(),
+                ],
+                46,
+                direction,
+            );
+            assert_eq!(layout.boxes[0].center().0, layout.boxes[1].center().0);
+            assert!(
+                layout
+                    .edges
+                    .values()
+                    .all(|&c| c == '│' || c == '▲' || c == '▼'),
+                "linear history should not jog sideways"
+            );
+            assert_eq!(layout.boxes.iter().map(|r| r.y).min(), Some(1));
         }
     }
     #[test]
