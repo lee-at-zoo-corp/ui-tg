@@ -2,8 +2,9 @@
 
 A colorless Rust terminal navigator for trees and directed graphs. Edges use
 Manhattan routing (horizontal and vertical segments). Supports cycles, self-loops,
-multiple parents, and disconnected components. Focus uses a double border. Enter or click briefly inverts only the activated node’s interior text and padding
-for 200 ms, keeping the border unchanged, using the terminal’s existing foreground and background.
+multiple parents, and disconnected components. Nodes have no borders and fit their
+label text, up to `--node-width`. The focused node uses reverse video with the
+terminal’s existing foreground and background.
 
 Requires Rust 1.85+, a Unix system with `sh`, and a UTF-8 terminal with mouse support.
 
@@ -57,8 +58,15 @@ characters are removed. Labels show up to eight lines, clipped to the node width
 `--node-width 40` changes the default width of 26 columns. Formatting never changes
 the payload sent on activation. Formatter failure aborts with the affected node ID.
 
+`--select-on-visit` also activates on initial focus and keyboard focus changes.
+Mouse selection always requires a click; hovering does not move focus or activate.
+Enter and clicks still activate explicitly.
+Panning, resizing, and moving within the same node do not trigger callbacks.
+When a command is busy, this mode remembers the latest visited node and runs its
+callback next, replacing any intermediate pending visits.
+
 Selection commands run in a worker so navigation remains responsive. One command
-runs at a time; activations while busy are ignored. The status line shows completion,
+runs at a time; explicit activations while busy are ignored unless visit mode is enabled. The status line shows completion,
 stdout, or a failure with stderr. Output is captured, so commands should be
 noninteractive and produce finite output. There is no command timeout. Quitting
 does not cancel an already started command. A hung formatter can be interrupted
@@ -75,6 +83,12 @@ with Ctrl+C before the TUI starts.
 | Mouse wheel | Scroll viewport |
 | Home | Bring focused node into view |
 | q / Esc / Ctrl+C | Quit |
+
+`--layout tree --direction south` draws a compact indented tree with side-entry
+connectors and no extra rows between single-line labels. `north` reverses its
+vertical order. This layout accepts forests; cycles and multiple parents require
+the default `--layout graph`. Node widths fit the label text, with one column of
+padding on each side, capped by `--node-width`.
 
 The viewport follows keyboard focus and terminal resizing. `--direction north|east|south|west` sets the direction from source to target
 (default: `east`). Labels remain upright in every direction. For Git history with
@@ -113,6 +127,31 @@ Use `--head branch-name` to choose another tip. Generated diff files remain in t
 system temporary directory so editor buffers remain usable. The graph contains the
 repository’s absolute local path; regenerate it on another machine.
 
+## Explore changed files with a shared diff window
+
+```sh
+cargo build --release
+python3 examples/git-review.py branch /path/to/repo --base origin/main
+```
+
+The branch graph flows north. Select a commit with Enter or click to open a new
+`ui-tg` window with a compact south-facing tree of its changed directories and files.
+Visit files using arrows, Tab, or mouse clicks to preview their diffs. Each file
+explorer owns one Kakoune session and one diff terminal, reused across file visits.
+Directories organize the tree; visiting them does not open a diff.
+
+Press `q` in the file explorer or close its window to close its Kakoune session and
+terminal and remove its temporary files. Closing the diff terminal manually is also
+supported: visiting another file reopens it. Selecting another commit closes the previous tree and its editor before opening
+the replacement. Closing the branch window also closes its tree and editor.
+
+This example requires Python 3, Git, Zutty, and Kakoune. Optional `xdotool` keeps
+keyboard focus in the file explorer when the first diff terminal opens. It uses
+`target/release/ui-tg` or `ui-tg` on `PATH`; `--ui-tg /path/to/ui-tg` overrides this.
+Use `--head branch-name` for another tip. Merge commits compare against their first
+parent; renames are shown as a deletion and an addition. Empty commits show just the
+root node. Binary diffs display Git’s binary-file notice.
+
 ## Development
 
 ```sh
@@ -121,4 +160,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo build
 python3 tests/terminal.py
+python3 tests/visit.py
+python3 tests/git_review.py
 ```
+
+The Kakoune GUI/lifecycle tests are opt-in. Run them inside a dedicated test
+Xephyr display with `UI_TG_GUI_TESTS=1 python3 tests/git_review.py`.
