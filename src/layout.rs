@@ -1,6 +1,6 @@
 use crate::model::Graph;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum Direction {
@@ -31,6 +31,7 @@ pub(crate) struct Layout {
     pub edges: BTreeMap<(usize, usize), char>,
     pub width: usize,
     pub height: usize,
+    outline: bool,
 }
 
 impl Layout {
@@ -85,28 +86,53 @@ impl Layout {
         let vertical = matches!(direction, Direction::North | Direction::South);
         let heights: Vec<_> = labels
             .iter()
-            .map(|label| label.lines().count().clamp(1, 8) + 2)
+            .map(|label| label.lines().count().clamp(1, 8))
+            .collect();
+        let widths: Vec<_> = labels
+            .iter()
+            .map(|label| {
+                label
+                    .lines()
+                    .map(UnicodeWidthStr::width)
+                    .max()
+                    .unwrap_or(0)
+                    .min(width.saturating_sub(2))
+                    + 2
+            })
             .collect();
         let mut layer_sizes = vec![0; graph.nodes.len()];
         for (i, &rank) in ranks.iter().enumerate() {
-            layer_sizes[rank] = layer_sizes[rank].max(if vertical { heights[i] } else { width });
+            layer_sizes[rank] =
+                layer_sizes[rank].max(if vertical { heights[i] } else { widths[i] });
         }
         let mut layer_positions = vec![2; graph.nodes.len()];
         for i in 1..layer_positions.len() {
-            layer_positions[i] = layer_positions[i - 1] + layer_sizes[i - 1] + 8;
+            layer_positions[i] =
+                layer_positions[i - 1] + layer_sizes[i - 1] + if vertical { 2 } else { 4 };
         }
         let mut rows = vec![1; graph.nodes.len()];
         let mut boxes = Vec::new();
         for (i, &h) in heights.iter().enumerate() {
             let rank = ranks[i];
-            let (flow_size, cross_size) = if vertical { (h, width) } else { (width, h) };
+            let (flow_size, cross_size) = if vertical {
+                (h, widths[i])
+            } else {
+                (widths[i], h)
+            };
             boxes.push(Rect {
                 x: layer_positions[rank],
                 y: rows[rank],
                 w: flow_size,
                 h: cross_size,
             });
-            rows[rank] += cross_size + 3;
+            rows[rank] += cross_size + if vertical { 2 } else { 1 };
+        }
+        if vertical {
+            let spans: Vec<_> = rows.iter().map(|&end| end.saturating_sub(3)).collect();
+            let widest = spans.iter().copied().max().unwrap_or(0);
+            for (i, rect) in boxes.iter_mut().enumerate() {
+                rect.y += widest / 2 - spans[ranks[i]] / 2;
+            }
         }
         let bottom = boxes.iter().map(|r| r.y + r.h).max().unwrap_or(1) + 2;
         let mut wires = BTreeMap::new();
@@ -117,15 +143,17 @@ impl Layout {
             let sy = source.y + source.h / 2;
             let ty = target.y + target.h / 2;
             let sx = source.x + source.w;
+            let track =
+                layer_positions[ranks[ids[a.as_str()]]] + layer_sizes[ranks[ids[a.as_str()]]] + 1;
             let tx = target.x - 1;
             let points = if ranks[ids[b.as_str()]] == ranks[ids[a.as_str()]] + 1 {
-                vec![(sx, sy), (sx + 2, sy), (sx + 2, ty), (tx, ty)]
+                vec![(sx, sy), (track, sy), (track, ty), (tx, ty)]
             } else {
                 let lane = bottom + index * 2;
                 vec![
                     (sx, sy),
-                    (sx + 2, sy),
-                    (sx + 2, lane),
+                    (track, sy),
+                    (track, lane),
                     (tx - 1, lane),
                     (tx - 1, ty),
                     (tx, ty),
@@ -181,7 +209,7 @@ impl Layout {
         for p in arrows {
             edges.insert(point(p), arrow);
         }
-        let boxes = boxes
+        let mut boxes: Vec<Rect> = boxes
             .into_iter()
             .map(|r| match direction {
                 Direction::East => r,
@@ -203,17 +231,167 @@ impl Layout {
                 },
             })
             .collect();
-        let (width, height) = if vertical {
+        let (width, mut height) = if vertical {
             (cross_extent, flow_extent)
         } else {
             (flow_extent, cross_extent)
         };
+        if vertical {
+            let first_row = boxes
+                .iter()
+                .map(|r| r.y)
+                .chain(edges.keys().map(|p| p.1))
+                .min()
+                .unwrap_or(1);
+            let trim = first_row.saturating_sub(1);
+            for rect in &mut boxes {
+                rect.y -= trim;
+            }
+            edges = edges
+                .into_iter()
+                .map(|((x, y), c)| ((x, y - trim), c))
+                .collect();
+            height = boxes
+                .iter()
+                .map(|r| r.y + r.h)
+                .chain(edges.keys().map(|p| p.1 + 1))
+                .max()
+                .unwrap_or(1)
+                + 1;
+        }
         Self {
             boxes,
             edges,
             width,
             height,
+            outline: false,
         }
+    }
+    pub fn tree(
+        graph: &Graph,
+        labels: &[String],
+        max_width: usize,
+        direction: Direction,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(direction, Direction::North | Direction::South),
+            "tree layout supports north or south direction"
+        );
+        let ids: HashMap<_, _> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.as_str(), i))
+            .collect();
+        let mut children = vec![Vec::new(); graph.nodes.len()];
+        let mut parents = vec![None; graph.nodes.len()];
+        for [from, to] in &graph.edges {
+            let (a, b) = (ids[from.as_str()], ids[to.as_str()]);
+            anyhow::ensure!(
+                parents[b].replace(a).is_none(),
+                "tree layout requires at most one parent per node"
+            );
+            children[a].push(b);
+        }
+        let mut stack: Vec<_> = parents
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(i, p)| p.is_none().then_some((i, 0)))
+            .collect();
+        let mut boxes = vec![
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0
+            };
+            graph.nodes.len()
+        ];
+        let mut seen = vec![false; graph.nodes.len()];
+        let mut y = 1;
+        while let Some((i, depth)) = stack.pop() {
+            anyhow::ensure!(!seen[i], "tree layout cannot contain cycles");
+            seen[i] = true;
+            let w = labels[i]
+                .lines()
+                .map(UnicodeWidthStr::width)
+                .max()
+                .unwrap_or(0)
+                .min(max_width.saturating_sub(2))
+                + 2;
+            let h = labels[i].lines().count().clamp(1, 8);
+            boxes[i] = Rect {
+                x: 1 + depth * 4,
+                y,
+                w,
+                h,
+            };
+            y += h;
+            for &child in children[i].iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+        anyhow::ensure!(
+            seen.iter().all(|&value| value),
+            "tree layout cannot contain cycles"
+        );
+        let mut wires = BTreeMap::new();
+        let mut arrows = Vec::new();
+        for (i, descendants) in children.iter().enumerate() {
+            if let Some(&last) = descendants.last() {
+                let trunk = boxes[i].x + 1;
+                segment(
+                    &mut wires,
+                    (trunk, boxes[i].y + boxes[i].h),
+                    (trunk, boxes[last].y),
+                );
+                *wires.entry((trunk, boxes[i].y + boxes[i].h)).or_default() |= 1;
+                for &child in descendants {
+                    let target = (boxes[child].x - 1, boxes[child].y);
+                    segment(&mut wires, (trunk, target.1), target);
+                    arrows.push(target);
+                }
+            }
+        }
+        let mut edges: BTreeMap<_, _> = wires
+            .into_iter()
+            .map(|(p, bits)| (p, junction(bits)))
+            .collect();
+        for p in arrows {
+            edges.insert(p, '▶');
+        }
+        let width = boxes.iter().map(|r| r.x + r.w + 1).max().unwrap_or(1);
+        let height = y + 1;
+        if matches!(direction, Direction::North) {
+            for rect in &mut boxes {
+                rect.y = height - rect.y - rect.h;
+            }
+            edges = edges
+                .into_iter()
+                .map(|((x, y), c)| {
+                    (
+                        (x, height - 1 - y),
+                        match c {
+                            '┌' => '└',
+                            '└' => '┌',
+                            '┐' => '┘',
+                            '┘' => '┐',
+                            '┬' => '┴',
+                            '┴' => '┬',
+                            other => other,
+                        },
+                    )
+                })
+                .collect();
+        }
+        Ok(Self {
+            boxes,
+            edges,
+            width,
+            height,
+            outline: true,
+        })
     }
     pub fn hit(&self, x: usize, y: usize) -> Option<usize> {
         self.boxes.iter().position(|r| r.contains(x, y))
@@ -229,7 +407,12 @@ impl Layout {
                 let vy = ny as isize - y as isize;
                 let forward = vx * dx + vy * dy;
                 let side = (vx * dy - vy * dx).unsigned_abs();
-                (forward > 0).then_some((i, forward.unsigned_abs() + side * 3))
+                let distance = if self.outline && dx == 0 {
+                    forward.unsigned_abs() * (self.width + 1) + side
+                } else {
+                    forward.unsigned_abs() + side * 3
+                };
+                (forward > 0).then_some((i, distance))
             })
             .min_by_key(|&(_, distance)| distance)
             .map_or(selected, |(i, _)| i)

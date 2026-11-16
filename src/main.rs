@@ -24,12 +24,24 @@ struct Args {
     /// Node width in terminal columns (labels are clipped to fit)
     #[arg(long, default_value_t = 26, value_parser = clap::value_parser!(u16).range(8..=120))]
     node_width: u16,
+    /// Graph layers or a compact indented tree (north/south only)
+    #[arg(long, value_enum, default_value_t = LayoutKind::Graph)]
+    layout: LayoutKind,
     /// Direction from parent/source toward child/target
     #[arg(long, value_enum, default_value_t = layout::Direction::East)]
     direction: layout::Direction,
+    /// Run on-selected on initial focus and keyboard visits; mouse selection requires a click
+    #[arg(long)]
+    select_on_visit: bool,
     /// Validate, format and print a static diagram without starting the TUI
     #[arg(long)]
     print: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LayoutKind {
+    Graph,
+    Tree,
 }
 
 fn main() -> Result<()> {
@@ -66,12 +78,20 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Result<_>>()?;
-    let layout = layout::Layout::new(
-        &graph,
-        &labels,
-        usize::from(args.node_width),
-        args.direction,
-    );
+    let layout = match args.layout {
+        LayoutKind::Graph => layout::Layout::new(
+            &graph,
+            &labels,
+            usize::from(args.node_width),
+            args.direction,
+        ),
+        LayoutKind::Tree => layout::Layout::tree(
+            &graph,
+            &labels,
+            usize::from(args.node_width),
+            args.direction,
+        )?,
+    };
     if args.print {
         ui::print(&layout, &labels)?;
     } else {
@@ -79,7 +99,12 @@ fn main() -> Result<()> {
             io::stdout().is_terminal(),
             "TUI output needs a terminal; use --print for redirected output"
         );
-        ui::run(&graph, &labels, &layout, &args.on_selected)?;
+        let mode = if args.select_on_visit {
+            ui::SelectionMode::Visit
+        } else {
+            ui::SelectionMode::Explicit
+        };
+        ui::run(&graph, &labels, &layout, &args.on_selected, mode)?;
     }
     Ok(())
 }

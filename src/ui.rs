@@ -22,7 +22,7 @@ use std::{
     io::{self, Write},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -49,45 +49,22 @@ impl Drop for Session {
 }
 
 type Canvas = BTreeMap<(usize, usize), char>;
-fn canvas(layout: &Layout, labels: &[String], selected: Option<usize>) -> Canvas {
+fn canvas(layout: &Layout, labels: &[String]) -> Canvas {
     let mut cells = layout.edges.clone();
     for (i, r) in layout.boxes.iter().enumerate() {
-        let focused = selected == Some(i);
-        let border = if focused {
-            ['╔', '═', '╗', '║', '╚', '╝']
-        } else {
-            ['┌', '─', '┐', '│', '└', '┘']
-        };
-        for x in r.x + 1..r.x + r.w - 1 {
-            cells.insert((x, r.y), border[1]);
-            cells.insert((x, r.y + r.h - 1), border[1]);
-        }
-        for y in r.y + 1..r.y + r.h - 1 {
-            cells.insert((r.x, y), border[3]);
-            cells.insert((r.x + r.w - 1, y), border[3]);
-        }
-        for (x, y, c) in [
-            (r.x, r.y, border[0]),
-            (r.x + r.w - 1, r.y, border[2]),
-            (r.x, r.y + r.h - 1, border[4]),
-            (r.x + r.w - 1, r.y + r.h - 1, border[5]),
-        ] {
-            cells.insert((x, y), c);
-        }
-        // Include padding so reverse video fills the entire node.
-        for y in r.y + 1..r.y + r.h - 1 {
-            for x in r.x + 1..r.x + r.w - 1 {
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
                 cells.insert((x, y), ' ');
             }
         }
-        for (row, line) in labels[i].lines().take(r.h - 2).enumerate() {
-            let mut x = r.x + 2;
-            for c in clipped(line, r.w - 4).chars() {
+        for (row, line) in labels[i].lines().take(r.h).enumerate() {
+            let mut x = r.x + 1;
+            for c in clipped(line, r.w.saturating_sub(2)).chars() {
                 let width = c.width().unwrap_or(0);
                 if width > 0 {
-                    cells.insert((x, r.y + 1 + row), c);
+                    cells.insert((x, r.y + row), c);
                     for continuation in x + 1..x + width {
-                        cells.remove(&(continuation, r.y + 1 + row));
+                        cells.remove(&(continuation, r.y + row));
                     }
                     x += width;
                 }
@@ -98,7 +75,7 @@ fn canvas(layout: &Layout, labels: &[String], selected: Option<usize>) -> Canvas
 }
 
 pub(crate) fn print(layout: &Layout, labels: &[String]) -> Result<()> {
-    let cells = canvas(layout, labels, None);
+    let cells = canvas(layout, labels);
     let mut out = io::BufWriter::new(io::stdout().lock());
     for y in 0..layout.height {
         let mut x = 0;
@@ -112,11 +89,18 @@ pub(crate) fn print(layout: &Layout, labels: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionMode {
+    Explicit,
+    Visit,
+}
+
 pub(crate) fn run(
     graph: &Graph,
     labels: &[String],
     layout: &Layout,
     selected_command: &str,
+    mode: SelectionMode,
 ) -> Result<()> {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -138,18 +122,27 @@ pub(crate) fn run(
     let mut busy = false;
     let mut follow = true;
     let mut dirty = true;
-    let mut flash: Option<(usize, Instant)> = None;
+    let mut pending = (mode == SelectionMode::Visit).then_some(selected);
     loop {
-        if flash.is_some_and(|(_, until)| Instant::now() >= until) {
-            flash = None;
-            dirty = true;
-        }
         if let Ok(result) = rx.try_recv() {
             busy = false;
             status = match result {
                 Ok(output) => format!("Done: {}", command::clean(&output).replace('\n', " | ")),
                 Err(error) => format!("Error: {error:#}"),
             };
+            dirty = true;
+        }
+        if let Some(node_index) = if busy { None } else { pending.take() } {
+            let node = &graph.nodes[node_index];
+            let cmd = selected_command.to_owned();
+            let id = node.id.clone();
+            let raw = node.data.get().to_owned();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(command::run(&cmd, &id, &raw));
+            });
+            busy = true;
+            status = "Running…".into();
             dirty = true;
         }
         let (width, height) = terminal::size()?;
@@ -179,17 +172,14 @@ pub(crate) fn run(
                 Clear(ClearType::All)
             )?;
             let mut reversed = false;
-            for ((x, y), c) in canvas(layout, labels, Some(selected)) {
+            for ((x, y), c) in canvas(layout, labels) {
                 let cw = c.width().unwrap_or(1).max(1);
                 if x >= offset.0
                     && y >= offset.1
                     && x + cw <= offset.0 + usize::from(width)
                     && y < offset.1 + view_h
                 {
-                    let reverse = flash.is_some_and(|(node, _)| {
-                        let r = layout.boxes[node];
-                        x > r.x && x < r.x + r.w - 1 && y > r.y && y < r.y + r.h - 1
-                    });
+                    let reverse = layout.boxes[selected].contains(x, y);
                     if reverse != reversed {
                         queue!(
                             out,
@@ -232,15 +222,11 @@ pub(crate) fn run(
             out.flush()?;
             dirty = false;
         }
-        let wait = flash.map_or(Duration::from_millis(100), |(_, until)| {
-            until
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100))
-        });
-        if !event::poll(wait)? {
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
         let mut activate = false;
+        let previously_selected = selected;
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('q')
@@ -309,21 +295,13 @@ pub(crate) fn run(
             Event::Resize(_, _) => follow = true,
             _ => {}
         }
+        activate |= mode == SelectionMode::Visit && selected != previously_selected;
         if activate {
-            if busy {
+            if busy && mode == SelectionMode::Explicit {
                 status = "Command still running".into();
             } else {
-                flash = Some((selected, Instant::now() + Duration::from_millis(200)));
-                let node = &graph.nodes[selected];
-                let cmd = selected_command.to_owned();
-                let id = node.id.clone();
-                let raw = node.data.get().to_owned();
-                let tx = tx.clone();
-                thread::spawn(move || {
-                    let _ = tx.send(command::run(&cmd, &id, &raw));
-                });
-                busy = true;
-                status = "Running…".into();
+                // Coalesce fast visits so the last focused node is never lost.
+                pending = Some(selected);
             }
         }
         dirty = true;
